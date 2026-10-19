@@ -153,9 +153,9 @@ app.get('/api/panel/fidelidad/buscar',auth,asyncRoute(async(req,res)=>{
  const q=String(req.query.q||'').trim();
  if(q.length<3||q.length>120)bad('Escribe al menos 3 caracteres del nombre, correo o teléfono');
  const search='%'+q.replace(/[\%_]/g,'\\$&')+'%';
- const [rows]=await pool.query(`SELECT c.id,c.nombre,c.correo,c.telefono,LEAST(10,COALESCE(fc.sellos,0)) AS sellos
+ const [rows]=await pool.query(`SELECT c.id,c.nombre,c.email AS correo,c.telefono,LEAST(10,COALESCE(fc.sellos,0)) AS sellos
  FROM clientes c LEFT JOIN fidelidad_cuentas fc ON fc.cliente_id=c.id
- WHERE c.nombre LIKE ? OR c.correo LIKE ? OR c.telefono LIKE ? ORDER BY c.nombre LIMIT 15`,[search,search,search]);
+ WHERE c.nombre LIKE ? OR c.email LIKE ? OR c.telefono LIKE ? ORDER BY c.nombre LIMIT 15`,[search,search,search]);
  res.json(rows);
 }));
 app.post('/api/panel/fidelidad/canjear',auth,rateLimit({windowMs:15*60*1000,limit:20}),asyncRoute(async(req,res)=>{
