@@ -70,7 +70,41 @@ app.get('/api/clientes/foto',clientAuth,verifiedClient,asyncRoute(async(req,res)
  if(!row?.foto_perfil)return res.status(404).json({error:'Sin foto de perfil'});
  res.set('Cache-Control','private, no-store');res.type(row.foto_mime);res.send(row.foto_perfil);
 }));
-app.get('/api/clientes/mis-reservas',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{const [rows]=await pool.query("SELECT r.codigo,r.fecha,TIME_FORMAT(r.hora,'%H:%i') AS hora,r.precio,r.estado,s.nombre AS servicio,b.nombre AS barbero FROM reservas r JOIN servicios s ON s.id=r.servicio_id JOIN barberos b ON b.id=r.barbero_id WHERE r.cliente_id=? ORDER BY r.fecha DESC,r.hora DESC LIMIT 100",[req.client.id]);res.json(rows);}));
+app.get('/api/clientes/mis-reservas',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{const [rows]=await pool.query("SELECT r.codigo,r.fecha,TIME_FORMAT(r.hora,'%H:%i') AS hora,r.precio,r.estado,r.servicio_id,r.barbero_id,s.nombre AS servicio,b.nombre AS barbero FROM reservas r JOIN servicios s ON s.id=r.servicio_id JOIN barberos b ON b.id=r.barbero_id WHERE r.cliente_id=? ORDER BY r.fecha DESC,r.hora DESC LIMIT 100",[req.client.id]);res.json(rows);}));
+
+// Cancelar o reprogramar una cita propia: el cliente nunca puede editar las de terceros.
+// Se bloquea la fila del barbero para serializar cambios y reservas nuevas del mismo profesional.
+app.patch('/api/clientes/mis-reservas/:codigo',clientAuth,verifiedClient,rateLimit({windowMs:15*60*1000,limit:20}),asyncRoute(async(req,res)=>{
+ const codigo=String(req.params.codigo||'');
+ if(!/^IMP-[A-Z0-9-]{6,40}$/i.test(codigo))bad('Código de cita inválido');
+ const action=String(req.body?.action||'');
+ if(!['cancel','reschedule'].includes(action))bad('Operación inválida');
+ const conn=await pool.getConnection();
+ try{
+  await conn.beginTransaction();
+  // Reservas normales y reprogramaciones comparten el mismo bloqueo de barbero.
+  const [[initial]]=await conn.query('SELECT barbero_id FROM reservas WHERE codigo=? AND cliente_id=?',[codigo,req.client.id]);
+  if(!initial)bad('Cita no encontrada',404);
+  await conn.query('SELECT id FROM barberos WHERE id=? FOR UPDATE',[initial.barbero_id]);
+  const [[r]]=await conn.query("SELECT id,barbero_id,servicio_id,fecha,TIME_FORMAT(hora,'%H:%i') AS hora,duracion_min,estado FROM reservas WHERE codigo=? AND cliente_id=? FOR UPDATE",[codigo,req.client.id]);
+  if(!r)bad('Cita no encontrada',404);
+  if(Number(r.barbero_id)!==Number(initial.barbero_id))bad('La cita cambió. Actualiza e intenta de nuevo',409);
+  if(!['pendiente','confirmada'].includes(r.estado))bad('La cita ya fue cerrada o cancelada',409);
+  if(r.fecha<todaySV()||(r.fecha===todaySV()&&r.hora<=nowSV()))bad('No se puede modificar una cita que ya comenzó',409);
+  if(action==='cancel'){
+   await conn.query("UPDATE reservas SET estado='cancelada' WHERE id=?",[r.id]);
+   await conn.commit();return res.json({ok:true,status:'cancelada'});
+  }
+  const date=String(req.body?.date||''),time=String(req.body?.time||'');
+  validateSlot(date,time,r.duracion_min);
+  if(date===r.fecha&&time===r.hora)bad('Elige un horario diferente');
+  const [appointments]=await conn.query("SELECT id,hora,duracion_min FROM reservas WHERE barbero_id=? AND fecha=? AND estado<>'cancelada' AND id<>? FOR UPDATE",[r.barbero_id,date,r.id]);
+  const [blocks]=await conn.query('SELECT hora,duracion_min FROM bloqueos WHERE barbero_id=? AND fecha=? FOR UPDATE',[r.barbero_id,date]);
+  if([...appointments,...blocks].some(x=>overlap(mins(time),r.duracion_min,mins(String(x.hora).slice(0,5)),x.duracion_min)))bad('Este horario ya no está disponible',409);
+  await conn.query('UPDATE reservas SET fecha=?,hora=? WHERE id=?',[date,time,r.id]);
+  await conn.commit();return res.json({ok:true,codigo,date,time});
+ }catch(e){await conn.rollback();throw e;}finally{conn.release();}
+}));
 
 // Asistencia física verificada por el barbero: un único resultado por cita.
 app.post('/api/reservas/:codigo/asistencia',auth,asyncRoute(async(req,res)=>{
