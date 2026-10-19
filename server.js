@@ -72,6 +72,35 @@ app.get('/api/clientes/foto',clientAuth,verifiedClient,asyncRoute(async(req,res)
 }));
 app.get('/api/clientes/mis-reservas',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{const [rows]=await pool.query("SELECT r.codigo,r.fecha,TIME_FORMAT(r.hora,'%H:%i') AS hora,r.precio,r.estado,s.nombre AS servicio,b.nombre AS barbero FROM reservas r JOIN servicios s ON s.id=r.servicio_id JOIN barberos b ON b.id=r.barbero_id WHERE r.cliente_id=? ORDER BY r.fecha DESC,r.hora DESC LIMIT 100",[req.client.id]);res.json(rows);}));
 
+// Asistencia física verificada por el barbero: un único resultado por cita.
+app.post('/api/reservas/:codigo/asistencia',auth,asyncRoute(async(req,res)=>{
+ const resultado=String(req.body?.resultado||'');
+ if(!['asistio','no_asistio'].includes(resultado))bad('Selecciona Asistió o No asistió');
+ const conn=await pool.getConnection();
+ try{
+  await conn.beginTransaction();
+  const [[r]]=await conn.query("SELECT id,barbero_id,fecha,TIME_FORMAT(hora,'%H:%i') AS hora,estado FROM reservas WHERE codigo=? FOR UPDATE",[req.params.codigo]);
+  if(!r)bad('Cita no encontrada',404);
+  allowBarber(req,r.barbero_id);
+  const [[u]]=await conn.query('SELECT id FROM usuarios WHERE id=? AND activo=1',[req.user.id]);
+  if(!u)bad('Usuario no autorizado',401);
+  if(r.estado==='cancelada')bad('No se puede registrar asistencia de una cita cancelada',409);
+  if(r.fecha>todaySV()||(r.fecha===todaySV()&&r.hora>nowSV()))bad('Espera a la hora de la cita para registrar asistencia',409);
+  const [[prev]]=await conn.query('SELECT id,resultado FROM asistencias WHERE reserva_id=? FOR UPDATE',[r.id]);
+  if(prev)bad('Esta cita ya tiene asistencia registrada: '+prev.resultado,409);
+  await conn.query('INSERT INTO asistencias(reserva_id,resultado,registrado_por) VALUES(?,?,?)',[r.id,resultado,u.id]);
+  if(resultado==='asistio')await conn.query("UPDATE reservas SET estado='finalizada' WHERE id=?",[r.id]);
+  await conn.commit();res.json({ok:true,resultado,sello_agregado:resultado==='asistio'});
+ }catch(e){await conn.rollback();throw e;}finally{conn.release();}
+}));
+// Recuento siempre desde la tabla de asistencias, nunca desde el navegador.
+app.get('/api/clientes/fidelidad',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{
+ const [[r]]=await pool.query(`SELECT COUNT(*) AS sellos FROM asistencias a JOIN reservas r ON r.id=a.reserva_id WHERE r.cliente_id=? AND a.resultado='asistio'`,[req.client.id]);
+ const sellos=Number(r.sellos);
+ // Premios de ejemplo, todavía no se canjean automáticamente.
+ const niveles=[{sellos:3,beneficio:'5% de descuento'},{sellos:5,beneficio:'10% de descuento'},{sellos:10,beneficio:'Arreglo de barba gratis'}];
+ res.json({sellos,niveles:niveles.map(x=>({...x,desbloqueado:sellos>=x.sellos})),nota:'Beneficios de ejemplo. El personal debe confirmar las condiciones antes de otorgarlos.'});
+}));
 app.get('/api/health',asyncRoute(async(req,res)=>{await pool.query('SELECT 1');res.json({ok:true,servicio:'Proyecto Denisse Barberia API'});}));
 app.get('/api/servicios',asyncRoute(async(req,res)=>{const [rows]=await pool.query('SELECT id,nombre AS name,descripcion AS description,duracion_min AS minutes,precio AS price FROM servicios WHERE activo=1 ORDER BY id');res.json(rows);}));
 app.get('/api/barberos',asyncRoute(async(req,res)=>{const [rows]=await pool.query('SELECT id,nombre AS name,especialidad AS specialty,foto AS photo FROM barberos WHERE activo=1 ORDER BY id');res.json(rows);}));
@@ -84,8 +113,8 @@ const [[c]]=await conn.query('SELECT id FROM clientes WHERE id=? AND verificado=
 }catch(e){await conn.rollback();throw e;}finally{conn.release();}}));
 app.post('/api/auth/login',rateLimit({windowMs:15*60*1000,limit:10}),asyncRoute(async(req,res)=>{const {email,password}=req.body||{};const [[u]]=await pool.query('SELECT * FROM usuarios WHERE email=? AND activo=1',[String(email||'').trim().toLowerCase()]);if(!u||!await bcrypt.compare(String(password||''),u.password_hash))bad('Correo o contraseña incorrectos',401);const token=jwt.sign({id:u.id,rol:u.rol,barbero_id:u.barbero_id},process.env.JWT_SECRET,{expiresIn:'8h'});res.json({token,user:{id:u.id,nombre:u.nombre,rol:u.rol,barbero_id:u.barbero_id}});}));
 app.get('/api/panel/yo',auth,asyncRoute(async(req,res)=>{const [[u]]=await pool.query('SELECT id,nombre,email,rol,barbero_id FROM usuarios WHERE id=? AND activo=1',[req.user.id]);if(!u)bad('Cuenta desactivada',401);res.json(u); }));
-app.get('/api/reservas',auth,asyncRoute(async(req,res)=>{let barber=+(req.query.barbero_id||req.user.barbero_id||1);allowBarber(req,barber);let date=String(req.query.fecha||todaySV());if(!iso(date))bad('Fecha inválida');const [rows]=await pool.query(`SELECT r.codigo AS id,r.servicio_id AS service,r.barbero_id AS barber,r.fecha AS date,TIME_FORMAT(r.hora,'%H:%i') AS time,c.nombre AS name,c.telefono AS phone,r.duracion_min AS minutes,r.precio AS price,r.estado AS status FROM reservas r JOIN clientes c ON c.id=r.cliente_id WHERE r.barbero_id=? AND r.fecha=? ORDER BY r.hora`,[barber,date]);res.json(rows);}));
-app.patch('/api/reservas/:codigo',auth,asyncRoute(async(req,res)=>{const status=String(req.body?.status||'');if(!['finalizada','cancelada','confirmada'].includes(status))bad('Estado no permitido');const [[r]]=await pool.query('SELECT barbero_id FROM reservas WHERE codigo=?',[req.params.codigo]);if(!r)bad('Reserva no encontrada',404);allowBarber(req,r.barbero_id);const [result]=await pool.query("UPDATE reservas SET estado=? WHERE codigo=? AND estado NOT IN ('finalizada','cancelada')",[status,req.params.codigo]);if(!result.affectedRows)bad('Esta reserva ya se cerró',409);res.json({ok:true,status});}));
+app.get('/api/reservas',auth,asyncRoute(async(req,res)=>{let barber=+(req.query.barbero_id||req.user.barbero_id||1);allowBarber(req,barber);let date=String(req.query.fecha||todaySV());if(!iso(date))bad('Fecha inválida');const [rows]=await pool.query(`SELECT r.codigo AS id,r.servicio_id AS service,r.barbero_id AS barber,r.fecha AS date,TIME_FORMAT(r.hora,'%H:%i') AS time,c.nombre AS name,c.telefono AS phone,r.duracion_min AS minutes,r.precio AS price,r.estado AS status,(SELECT a.resultado FROM asistencias a WHERE a.reserva_id=r.id) AS asistencia FROM reservas r JOIN clientes c ON c.id=r.cliente_id WHERE r.barbero_id=? AND r.fecha=? ORDER BY r.hora`,[barber,date]);res.json(rows);}));
+app.patch('/api/reservas/:codigo',auth,asyncRoute(async(req,res)=>{const status=String(req.body?.status||'');if(!['cancelada','confirmada'].includes(status))bad('Para finalizar una cita utiliza Asistió o No asistió');const [[r]]=await pool.query('SELECT barbero_id FROM reservas WHERE codigo=?',[req.params.codigo]);if(!r)bad('Reserva no encontrada',404);allowBarber(req,r.barbero_id);const [result]=await pool.query("UPDATE reservas SET estado=? WHERE codigo=? AND estado NOT IN ('finalizada','cancelada')",[status,req.params.codigo]);if(!result.affectedRows)bad('Esta reserva ya se cerró',409);res.json({ok:true,status});}));
 app.get('/api/bloqueos',auth,asyncRoute(async(req,res)=>{const barber=Number(req.user.rol==='barbero'?req.user.barbero_id:(req.query.barbero_id||1));allowBarber(req,barber);const [rows]=await pool.query("SELECT id,barbero_id AS barber,fecha AS date,TIME_FORMAT(hora,'%H:%i') AS time,duracion_min AS minutes,motivo FROM bloqueos WHERE barbero_id=? AND fecha>=CURDATE() ORDER BY fecha,hora",[barber]);res.json(rows.map(x=>({...x,id:String(x.id)})));}));
 app.post('/api/bloqueos',auth,asyncRoute(async(req,res)=>{const barber=Number(req.user.rol==='barbero'?req.user.barbero_id:req.body?.barber),date=req.body?.date,time=req.body?.time,minutes=+req.body?.minutes;allowBarber(req,barber);if(!Number.isInteger(minutes)||minutes<15||minutes>600||minutes%15!==0)bad('Duración: múltiplos de 15 minutos, máximo 10 horas');if(!iso(date)||!hh(time))bad('Fecha u hora inválida');if(date<todaySV()||(date===todaySV()&&time<=nowSV()))bad('No se puede bloquear una fecha pasada');if(mins(time)<480||mins(time)+minutes>1140)bad('El descanso debe estar entre 8:00 AM y 7:00 PM');const conn=await pool.getConnection();try{await conn.beginTransaction();const [[b]]=await conn.query('SELECT id FROM barberos WHERE id=? FOR UPDATE',[barber]);if(!b)bad('Barbero inválido');if(await unavailable(conn,barber,date,time,minutes))bad('Se cruza con una cita o bloqueo',409);const [r]=await conn.query('INSERT INTO bloqueos(barbero_id,fecha,hora,duracion_min) VALUES(?,?,?,?)',[barber,date,time,minutes]);await conn.commit();res.status(201).json({id:String(r.insertId),barber,date,time,minutes});}catch(e){await conn.rollback();throw e;}finally{conn.release();}}));
 app.delete('/api/bloqueos/:id',auth,asyncRoute(async(req,res)=>{const [[b]]=await pool.query('SELECT barbero_id FROM bloqueos WHERE id=?',[req.params.id]);if(!b)bad('Bloqueo no encontrado',404);allowBarber(req,b.barbero_id);await pool.query('DELETE FROM bloqueos WHERE id=?',[req.params.id]);res.json({ok:true});}));
