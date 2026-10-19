@@ -113,7 +113,7 @@ app.post('/api/reservas/:codigo/asistencia',auth,asyncRoute(async(req,res)=>{
  const conn=await pool.getConnection();
  try{
   await conn.beginTransaction();
-  const [[r]]=await conn.query("SELECT id,barbero_id,fecha,TIME_FORMAT(hora,'%H:%i') AS hora,estado FROM reservas WHERE codigo=? FOR UPDATE",[req.params.codigo]);
+  const [[r]]=await conn.query("SELECT id,cliente_id,barbero_id,fecha,TIME_FORMAT(hora,'%H:%i') AS hora,estado FROM reservas WHERE codigo=? FOR UPDATE",[req.params.codigo]);
   if(!r)bad('Cita no encontrada',404);
   allowBarber(req,r.barbero_id);
   const [[u]]=await conn.query('SELECT id FROM usuarios WHERE id=? AND activo=1',[req.user.id]);
@@ -123,17 +123,56 @@ app.post('/api/reservas/:codigo/asistencia',auth,asyncRoute(async(req,res)=>{
   const [[prev]]=await conn.query('SELECT id,resultado FROM asistencias WHERE reserva_id=? FOR UPDATE',[r.id]);
   if(prev)bad('Esta cita ya tiene asistencia registrada: '+prev.resultado,409);
   await conn.query('INSERT INTO asistencias(reserva_id,resultado,registrado_por) VALUES(?,?,?)',[r.id,resultado,u.id]);
+  let selloAgregado=false;
+  if(resultado==='asistio'){
+   await conn.query('INSERT IGNORE INTO fidelidad_cuentas(cliente_id,sellos) VALUES(?,0)',[r.cliente_id]);
+   const [[cuenta]]=await conn.query('SELECT sellos FROM fidelidad_cuentas WHERE cliente_id=? FOR UPDATE',[r.cliente_id]);
+   if(Number(cuenta.sellos)<10){
+    await conn.query('UPDATE fidelidad_cuentas SET sellos=sellos+1 WHERE cliente_id=?',[r.cliente_id]);
+    await conn.query("INSERT INTO fidelidad_movimientos(cliente_id,reserva_id,tipo,sellos_antes,sellos_despues,registrado_por,detalle) VALUES(?,?,'sello',?,?,?,?)",[r.cliente_id,r.id,cuenta.sellos,Number(cuenta.sellos)+1,u.id,'Asistencia confirmada']);
+    selloAgregado=true;
+   }
+  }
+
   if(resultado==='asistio')await conn.query("UPDATE reservas SET estado='finalizada' WHERE id=?",[r.id]);
-  await conn.commit();res.json({ok:true,resultado,sello_agregado:resultado==='asistio'});
+  await conn.commit();res.json({ok:true,resultado,sello_agregado:selloAgregado});
  }catch(e){await conn.rollback();throw e;}finally{conn.release();}
 }));
-// Recuento siempre desde la tabla de asistencias, nunca desde el navegador.
+// Fidelidad V6: saldo limitado a 10. Un canje lo registra solo el personal.
 app.get('/api/clientes/fidelidad',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{
- const [[r]]=await pool.query(`SELECT COUNT(*) AS sellos FROM asistencias a JOIN reservas r ON r.id=a.reserva_id WHERE r.cliente_id=? AND a.resultado='asistio'`,[req.client.id]);
- const sellos=Number(r.sellos);
- // Premios de ejemplo, todavía no se canjean automáticamente.
- const niveles=[{sellos:3,beneficio:'5% de descuento'},{sellos:5,beneficio:'10% de descuento'},{sellos:10,beneficio:'Arreglo de barba gratis'}];
- res.json({sellos,niveles:niveles.map(x=>({...x,desbloqueado:sellos>=x.sellos})),nota:'Beneficios de ejemplo. El personal debe confirmar las condiciones antes de otorgarlos.'});
+ const [[cuenta]]=await pool.query('SELECT sellos FROM fidelidad_cuentas WHERE cliente_id=?',[req.client.id]);
+ const sellos=Number(cuenta?.sellos||0);
+ const [historial]=await pool.query('SELECT tipo,sellos_antes,sellos_despues,detalle,creado_en FROM fidelidad_movimientos WHERE cliente_id=? ORDER BY id DESC LIMIT 30',[req.client.id]);
+ res.json({sellos,max_sellos:10,premio:'Arreglo de barba gratis',listo_para_canjear:sellos===10,
+  niveles:[{sellos:10,beneficio:'Arreglo de barba gratis',desbloqueado:sellos===10}],historial,
+  nota:'Al llegar a diez sellos, muestra tu tarjeta al personal para canjear el beneficio.'});
+}));
+// Canje exclusivamente en barbería: requiere JWT de barbero o administrador.
+// Consulta de tarjeta por personal autenticado para canje presencial.
+app.get('/api/panel/fidelidad/buscar',auth,asyncRoute(async(req,res)=>{
+ const q=String(req.query.q||'').trim();
+ if(q.length<3||q.length>120)bad('Escribe al menos 3 caracteres del nombre, correo o teléfono');
+ const search='%'+q.replace(/[\%_]/g,'\\$&')+'%';
+ const [rows]=await pool.query(`SELECT c.id,c.nombre,c.correo,c.telefono,LEAST(10,COALESCE(fc.sellos,0)) AS sellos
+ FROM clientes c LEFT JOIN fidelidad_cuentas fc ON fc.cliente_id=c.id
+ WHERE c.nombre LIKE ? OR c.correo LIKE ? OR c.telefono LIKE ? ORDER BY c.nombre LIMIT 15`,[search,search,search]);
+ res.json(rows);
+}));
+app.post('/api/panel/fidelidad/canjear',auth,rateLimit({windowMs:15*60*1000,limit:20}),asyncRoute(async(req,res)=>{
+ const clienteId=Number(req.body?.cliente_id);
+ if(!Number.isSafeInteger(clienteId)||clienteId<1)bad('Selecciona un cliente válido');
+ const conn=await pool.getConnection();
+ try{
+  await conn.beginTransaction();
+  const [[c]]=await conn.query('SELECT id FROM clientes WHERE id=?',[clienteId]);
+  if(!c)bad('Cliente no encontrado',404);
+  await conn.query('INSERT IGNORE INTO fidelidad_cuentas(cliente_id,sellos) VALUES(?,0)',[clienteId]);
+  const [[cuenta]]=await conn.query('SELECT sellos FROM fidelidad_cuentas WHERE cliente_id=? FOR UPDATE',[clienteId]);
+  if(Number(cuenta.sellos)!==10)bad('El cliente necesita 10 sellos para canjear el premio',409);
+  await conn.query('UPDATE fidelidad_cuentas SET sellos=0 WHERE cliente_id=?',[clienteId]);
+  await conn.query("INSERT INTO fidelidad_movimientos(cliente_id,tipo,sellos_antes,sellos_despues,registrado_por,detalle) VALUES(?,'canje',10,0,?,?)",[clienteId,req.user.id,'Arreglo de barba gratis']);
+  await conn.commit();res.json({ok:true,sellos:0,premio:'Arreglo de barba gratis'});
+ }catch(e){await conn.rollback();throw e;}finally{conn.release();}
 }));
 app.get('/api/health',asyncRoute(async(req,res)=>{await pool.query('SELECT 1');res.json({ok:true,servicio:'Proyecto Denisse Barberia API'});}));
 app.get('/api/servicios',asyncRoute(async(req,res)=>{const [rows]=await pool.query('SELECT id,nombre AS name,descripcion AS description,duracion_min AS minutes,precio AS price FROM servicios WHERE activo=1 ORDER BY id');res.json(rows);}));
