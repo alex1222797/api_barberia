@@ -55,12 +55,27 @@ app.post('/api/clientes/auth/login',clientLimiter,asyncRoute(async(req,res)=>{
  res.json({token:clientToken(client),cliente:{id:client.id,nombre:client.nombre,email:client.email}});
 }));
 app.get('/api/clientes/yo',clientAuth,verifiedClient,(req,res)=>res.json({cliente:req.client}));
+// Foto de perfil: guardada en Aiven, máximo 1 MiB, JPEG/PNG/WebP.
+app.put('/api/clientes/foto',clientAuth,verifiedClient,express.raw({type:['image/jpeg','image/png','image/webp'],limit:'1mb'}),asyncRoute(async(req,res)=>{
+ const mime=req.get('content-type')?.split(';')[0]?.toLowerCase();
+ if(!['image/jpeg','image/png','image/webp'].includes(mime)||!Buffer.isBuffer(req.body)||req.body.length<12)bad('Selecciona una imagen JPG, PNG o WebP de hasta 1 MB');
+ const d=req.body;
+ const valid=(mime==='image/jpeg'&&d[0]===0xff&&d[1]===0xd8&&d[2]===0xff)||(mime==='image/png'&&d.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10])))||(mime==='image/webp'&&d.toString('ascii',0,4)==='RIFF'&&d.toString('ascii',8,12)==='WEBP');
+ if(!valid)bad('El archivo no es una imagen válida');
+ await pool.query('UPDATE clientes SET foto_perfil=?,foto_mime=? WHERE id=?',[d,mime,req.client.id]);
+ res.json({ok:true});
+}));
+app.get('/api/clientes/foto',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{
+ const [[row]]=await pool.query('SELECT foto_perfil,foto_mime FROM clientes WHERE id=?',[req.client.id]);
+ if(!row?.foto_perfil)return res.status(404).json({error:'Sin foto de perfil'});
+ res.set('Cache-Control','private, no-store');res.type(row.foto_mime);res.send(row.foto_perfil);
+}));
 app.get('/api/clientes/mis-reservas',clientAuth,verifiedClient,asyncRoute(async(req,res)=>{const [rows]=await pool.query("SELECT r.codigo,r.fecha,TIME_FORMAT(r.hora,'%H:%i') AS hora,r.precio,r.estado,s.nombre AS servicio,b.nombre AS barbero FROM reservas r JOIN servicios s ON s.id=r.servicio_id JOIN barberos b ON b.id=r.barbero_id WHERE r.cliente_id=? ORDER BY r.fecha DESC,r.hora DESC LIMIT 100",[req.client.id]);res.json(rows);}));
 
 app.get('/api/health',asyncRoute(async(req,res)=>{await pool.query('SELECT 1');res.json({ok:true,servicio:'Proyecto Denisse Barberia API'});}));
 app.get('/api/servicios',asyncRoute(async(req,res)=>{const [rows]=await pool.query('SELECT id,nombre AS name,descripcion AS description,duracion_min AS minutes,precio AS price FROM servicios WHERE activo=1 ORDER BY id');res.json(rows);}));
 app.get('/api/barberos',asyncRoute(async(req,res)=>{const [rows]=await pool.query('SELECT id,nombre AS name,especialidad AS specialty,foto AS photo FROM barberos WHERE activo=1 ORDER BY id');res.json(rows);}));
-app.get('/api/disponibilidad',asyncRoute(async(req,res)=>{const barber=+req.query.barbero_id,service=+req.query.servicio_id,date=String(req.query.fecha||'');const [[s]]=await pool.query('SELECT duracion_min FROM servicios WHERE id=? AND activo=1',[service]);if(!s||!Number.isInteger(barber))bad('Servicio o barbero inválido');if(!iso(date))bad('Fecha inválida');const [appointments]=await pool.query("SELECT hora,duracion_min FROM reservas WHERE barbero_id=? AND fecha=? AND estado<>'cancelada'",[barber,date]);const [blocks]=await pool.query('SELECT hora,duracion_min FROM bloqueos WHERE barbero_id=? AND fecha=?',[barber,date]);const data=[];for(let m=540;m<=1080;m+=15){if(m+s.duracion_min>1140)continue;const t=String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');let disabled=false;try{validateSlot(date,t,s.duracion_min);}catch{disabled=true;}disabled ||= [...appointments,...blocks].some(x=>overlap(m,s.duracion_min,mins(String(x.hora).slice(0,5)),x.duracion_min));data.push({time:t,disabled});}res.json(data);}));
+app.get('/api/disponibilidad',asyncRoute(async(req,res)=>{const barber=+req.query.barbero_id,service=+req.query.servicio_id,date=String(req.query.fecha||'');const [[s]]=await pool.query('SELECT duracion_min FROM servicios WHERE id=? AND activo=1',[service]);if(!s||!Number.isInteger(barber))bad('Servicio o barbero inválido');if(!iso(date))bad('Fecha inválida');const [appointments]=await pool.query("SELECT hora,duracion_min FROM reservas WHERE barbero_id=? AND fecha=? AND estado<>'cancelada'",[barber,date]);const [blocks]=await pool.query('SELECT hora,duracion_min FROM bloqueos WHERE barbero_id=? AND fecha=?',[barber,date]);const data=[];for(let m=540;m<=1080;m+=15){if(m+s.duracion_min>1140)continue;const t=String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0');let past=false;try{validateSlot(date,t,s.duracion_min);}catch{past=true;}const busy=[...appointments,...blocks].some(x=>overlap(m,s.duracion_min,mins(String(x.hora).slice(0,5)),x.duracion_min));data.push({time:t,disabled:past||busy,reason:past?'past':busy?'occupied':null});}res.json(data);}));
 app.post('/api/reservas',clientAuth,verifiedClient,rateLimit({windowMs:15*60*1000,limit:15}),asyncRoute(async(req,res)=>{const {service,barber,date,time}=req.body||{};const cleanName=String(req.client.nombre||'').trim(),cleanPhone=String(req.client.telefono||'').trim();const serviceId=+service,barberId=+barber;if(cleanName.length<2||cleanName.length>70)bad('Cuenta de cliente inválida',401);const conn=await pool.getConnection();try{await conn.beginTransaction();const [[s]]=await conn.query('SELECT duracion_min,precio FROM servicios WHERE id=? AND activo=1',[serviceId]);const [[b]]=await conn.query('SELECT id FROM barberos WHERE id=? AND activo=1',[barberId]);if(!s||!b)bad('Servicio o barbero inexistente');validateSlot(date,time,s.duracion_min);
 // Serializar reservas por barbero mediante bloqueo de su fila. Evita doble reserva simultánea.
 await conn.query('SELECT id FROM barberos WHERE id=? FOR UPDATE',[barberId]);

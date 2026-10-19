@@ -1,0 +1,1 @@
+Agenda V6: devuelve reason=occupied o past para que el frontend muestre rojo solo a reservas y bloqueos. La proteccion real contra doble reserva ya existe mediante transaccion y bloqueo de la fila del barbero. NO requiere migracion SQL. Reemplaza server.js, git add . && git commit -m "Agenda visual V6" && git push origin main.
